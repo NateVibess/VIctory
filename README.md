@@ -128,6 +128,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_HOST_TEXTURE_MAX_DIM=<n>` | skip host copies of sampled-only textures wider or taller than `n` (render targets and depth still created) |
 | `VICTORY_HOST_TEXTURE_BUDGET_MB=<n>` | after about `n` MiB of host texture copies, skip further sampled-only creates |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_EMULATE_WAVE_SIZE=1` | drop DXIL `WaveSize` and lower cross-lane ops through groupshared so wave64 computes can run on 32-lane GPUs / WARP (own shader cache entries; diagnostics builds) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

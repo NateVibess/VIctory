@@ -191,6 +191,14 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Console wave size emulated with groupshared (`VICTORY_EMULATE_WAVE_SIZE`);
+    /// DXIL has no `WaveSize` attribute then.
+    emulate_wave: Option<u32>,
+    /// First dword of LDS reserved for wave-emulation scratch.
+    wave_scratch: u32,
+    /// Group barriers around title LDS: WaveSize was dropped so the host
+    /// may split a console wave across several host waves.
+    lds_group_barrier: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -406,6 +414,27 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
+        // Emulate console WaveSize when the host cannot declare it (32-lane
+        // NVIDIA, WARP): drop DXIL WaveSize. Cross-lane ops use groupshared
+        // scratch; one-wave LDS that relied on wave coherence gets group
+        // barriers instead (the host may run the group as several waves).
+        let (emulate_wave, wave_scratch, lds_group_barrier) = if let (Some(wave), true) =
+            (s.wave_size, super::emulate_wave_size())
+        {
+            s.wave_size = None;
+            if console_lanes {
+                let threads = s.threads.map(|t| t.iter().product::<u32>()).unwrap_or(1).max(1);
+                let waves = threads.div_ceil(wave);
+                let scratch = waves.saturating_mul(wave.saturating_add(2));
+                let base = s.lds_dwords;
+                s.lds_dwords = base.saturating_add(scratch);
+                (Some(wave), base, true)
+            } else {
+                (None, 0, true)
+            }
+        } else {
+            (None, 0, false)
+        };
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
@@ -488,6 +517,9 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            emulate_wave,
+            wave_scratch,
+            lds_group_barrier,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -767,12 +799,19 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
-        self.s.flags |= flags::WAVE_OPS;
         let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
+        if self.emulate_wave.is_some() {
+            if prefix.is_some() {
+                return Err("an emulated wave prefix");
+            }
+            let x = if float { self.as_int(arg) } else { arg };
+            return self.emulate_active_op(c, op, x);
+        }
+        self.s.flags |= flags::WAVE_OPS;
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
@@ -821,6 +860,78 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if float { self.as_int(r) } else { r })
+    }
+
+    /// Tree reduction of `x` (already masked) over the emulated wave.
+    fn emulate_active_op(&mut self, at: usize, op: super::wave::Op, x: V) -> Result<V, Why> {
+        let n = self.emulate_wave.ok_or("emulate_wave")?;
+        let me = self.lane_index_at(at);
+        let p = self.wave_scratch_ptr(at, me);
+        self.s.m.store(at, p, x);
+        self.wave_sync(at);
+        // Steps N/2 .. 1: lanes below `step` fold with lane+step.
+        let mut step = n / 2;
+        while step >= 1 {
+            let step_v = self.s.m.i32(step);
+            let low = self.s.m.cmp(at, pred::IULT, me, step_v);
+            let other = self.s.m.bin(at, Bin::Add, me, step_v);
+            let p_me = self.wave_scratch_ptr(at, me);
+            let p_ot = self.wave_scratch_ptr(at, other);
+            let a = self.s.m.load(at, p_me);
+            let b = self.s.m.load(at, p_ot);
+            let folded = self.emulate_fold(at, op, a, b)?;
+            let keep = self.s.m.select(at, low, folded, a);
+            self.s.m.store(at, p_me, keep);
+            self.wave_sync(at);
+            step /= 2;
+        }
+        let zero = self.s.m.i32(0);
+        let p0 = self.wave_scratch_ptr(at, zero);
+        Ok(self.s.m.load(at, p0))
+    }
+
+    fn emulate_fold(&mut self, at: usize, op: super::wave::Op, a: V, b: V) -> Result<V, Why> {
+        use super::wave::Op;
+        Ok(match op {
+            Op::AddU => self.s.m.bin(at, Bin::Add, a, b),
+            Op::AddF => {
+                let af = self.as_float(a);
+                let bf = self.as_float(b);
+                let r = self.s.m.bin(at, Bin::Add, af, bf);
+                self.as_int(r)
+            }
+            Op::Or => self.s.m.bin(at, Bin::Or, a, b),
+            Op::And => self.s.m.bin(at, Bin::And, a, b),
+            Op::Xor => self.s.m.bin(at, Bin::Xor, a, b),
+            Op::MinU => {
+                let c = self.s.m.cmp(at, pred::IULT, a, b);
+                self.s.m.select(at, c, a, b)
+            }
+            Op::MaxU => {
+                let c = self.s.m.cmp(at, pred::IUGT, a, b);
+                self.s.m.select(at, c, a, b)
+            }
+            Op::MinI => {
+                let c = self.s.m.cmp(at, pred::SLT, a, b);
+                self.s.m.select(at, c, a, b)
+            }
+            Op::MaxI => {
+                let c = self.s.m.cmp(at, pred::SGT, a, b);
+                self.s.m.select(at, c, a, b)
+            }
+            Op::MinF => {
+                let af = self.as_float(a);
+                let bf = self.as_float(b);
+                let r = self.max_min(false, af, bf);
+                self.as_int(r)
+            }
+            Op::MaxF => {
+                let af = self.as_float(a);
+                let bf = self.as_float(b);
+                let r = self.max_min(true, af, bf);
+                self.as_int(r)
+            }
+        })
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -1210,18 +1321,60 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = if self.emulate_wave.is_some() {
+                    self.emulate_ballot(at, bit)
+                } else {
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let r = self
+                        .s
+                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                    self.s.flags |= flags::WAVE_OPS;
+                    (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
+                };
                 self.ballots.insert(lo, xy);
                 xy
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Ballot of `bit` over the emulated wave: lo = lanes 0..31, hi = 32..63.
+    fn emulate_ballot(&mut self, at: usize, bit: V) -> (V, V) {
+        let n = self.emulate_wave.expect("emulate");
+        let me = self.lane_index_at(at);
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let bit_i = self.s.m.select(at, bit, one, zero);
+        let p = self.wave_scratch_ptr(at, me);
+        self.s.m.store(at, p, bit_i);
+        self.wave_sync(at);
+        let mut lo = zero;
+        for i in 0..32u32 {
+            if i >= n {
+                break;
+            }
+            let lane = self.s.m.i32(i);
+            let q = self.wave_scratch_ptr(at, lane);
+            let v = self.s.m.load(at, q);
+            let sh = self.s.m.i32(i);
+            let b = self.s.m.bin(at, Bin::Shl, v, sh);
+            lo = self.s.m.bin(at, Bin::Or, lo, b);
+        }
+        let mut hi = zero;
+        for i in 0..32u32 {
+            let lane_i = 32 + i;
+            if lane_i >= n {
+                break;
+            }
+            let lane = self.s.m.i32(lane_i);
+            let q = self.wave_scratch_ptr(at, lane);
+            let v = self.s.m.load(at, q);
+            let sh = self.s.m.i32(i);
+            let b = self.s.m.bin(at, Bin::Shl, v, sh);
+            hi = self.s.m.bin(at, Bin::Or, hi, b);
+        }
+        (lo, hi)
     }
 
     // ---- operands ----
@@ -1887,7 +2040,9 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        // Emulated waves: host flat ids already match console lane order
+        // within each virtual wave of `emulate_wave` threads.
+        if !self.console_lanes || self.emulate_wave.is_some() {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
@@ -1990,7 +2145,47 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// Flattened thread id in the group (compute).
+    fn flat_id(&mut self, at: usize) -> V {
+        self.s.op(
+            at,
+            "flattenedThreadIdInGroup.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            96,
+            &[],
+        )
+    }
+
+    /// Groupshared + UAV fence used between wave-emulation steps.
+    fn wave_sync(&mut self, at: usize) {
+        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+        let mode = self.s.m.i32(mode);
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+    }
+
+    /// Pointer to wave-emulation scratch dword `lane` of this thread's
+    /// virtual wave (`VICTORY_EMULATE_WAVE_SIZE`).
+    fn wave_scratch_ptr(&mut self, at: usize, lane: V) -> V {
+        let n = self.emulate_wave.expect("emulate_wave");
+        let flat = self.flat_id(at);
+        let wave = self.s.m.i32(n);
+        let wave_id = self.s.m.bin(at, Bin::UDiv, flat, wave);
+        let stride = self.s.m.i32(n + 2);
+        let base = self.s.m.i32(self.wave_scratch);
+        let off = self.s.m.bin(at, Bin::Mul, wave_id, stride);
+        let off = self.s.m.bin(at, Bin::Add, base, off);
+        let index = self.s.m.bin(at, Bin::Add, off, lane);
+        let lds = self.s.lds();
+        self.s.m.element(at, lds, index)
+    }
+
     fn lane_index(&mut self) -> V {
+        self.lane_index_at(self.cur)
+    }
+
+    fn lane_index_at(&mut self, at: usize) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
@@ -1998,8 +2193,13 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
+        if let Some(n) = self.emulate_wave {
+            let flat = self.flat_id(at);
+            let mask = self.s.m.i32(n - 1);
+            return self.s.m.bin(at, Bin::And, flat, mask);
+        }
         self.s.op(
-            self.cur,
+            at,
             "waveGetLaneIndex",
             Attr::ReadOnly,
             self.s.t.i32,
@@ -2033,6 +2233,19 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        if self.emulate_wave.is_some() {
+            let at = self.cur;
+            let me = self.lane_index_at(at);
+            let p = self.wave_scratch_ptr(at, me);
+            self.s.m.store(at, p, x);
+            self.wave_sync(at);
+            // Lane indices from the title are console lanes (mod wave).
+            let n = self.emulate_wave.unwrap();
+            let mask = self.s.m.i32(n - 1);
+            let lane = self.s.m.bin(at, Bin::And, lane, mask);
+            let p = self.wave_scratch_ptr(at, lane);
+            return self.s.m.load(at, p);
+        }
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -2171,6 +2384,9 @@ impl<'a> Lower<'a> {
                 return Err("an LDS read of bytes or halves");
             };
             let reg = dst_reg.ok_or("an LDS read result")?;
+            if self.lds_group_barrier {
+                self.wave_sync(self.cur);
+            }
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
@@ -2203,6 +2419,9 @@ impl<'a> Lower<'a> {
                 self.s.m.store(self.cur, p, x);
             }
             self.end_guarded(at, &[]);
+            if self.lds_group_barrier {
+                self.wave_sync(self.cur);
+            }
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -4246,6 +4465,13 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
+                if self.emulate_wave.is_some() {
+                    // First lane of the virtual wave (lane 0); inactive
+                    // callers still receive lane 0's value after the sync.
+                    let zero = self.s.m.i32(0);
+                    let r = self.read_lane(a, zero);
+                    return int(self, r);
+                }
                 self.s.flags |= flags::WAVE_OPS;
                 let r = self.s.op(
                     c,

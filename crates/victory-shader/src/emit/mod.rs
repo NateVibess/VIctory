@@ -2,7 +2,10 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it. With the
+//! diagnostics env `VICTORY_EMULATE_WAVE_SIZE=1`, that requirement is
+//! dropped and cross-lane ops are lowered through groupshared memory so a
+//! 32-lane GPU (or WARP) can run wave64 programs.
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -119,6 +122,16 @@ pub fn loop_limit() -> u32 {
         } else {
             lower::LOOP_LIMIT
         }
+    })
+}
+
+/// Whether cross-lane compute is lowered through groupshared memory instead
+/// of DXIL `WaveSize` (diagnostics: `VICTORY_EMULATE_WAVE_SIZE=1`). Part of
+/// the translation; the shader cache keys on it.
+pub fn emulate_wave_size() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_EMULATE_WAVE_SIZE").is_some()
     })
 }
 
