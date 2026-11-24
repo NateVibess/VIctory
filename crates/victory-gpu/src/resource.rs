@@ -961,24 +961,36 @@ fn make_host_texture(
         if let Some(max) = host_texture_max_dim() {
             let dim = u32::try_from(desc.width).unwrap_or(u32::MAX).max(desc.height);
             if dim > max {
-                tracing::debug!(
-                    ?desc,
-                    max,
-                    "host texture skipped (VICTORY_HOST_TEXTURE_MAX_DIM)"
-                );
+                static SKIPPED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n.is_power_of_two() {
+                    tracing::info!(
+                        n,
+                        ?desc,
+                        max,
+                        "host texture skipped (VICTORY_HOST_TEXTURE_MAX_DIM)"
+                    );
+                }
                 return None;
             }
         }
         if let Some(budget) = host_texture_budget_bytes() {
             let used = HOST_TEXTURE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
             if used.saturating_add(bytes) > budget {
-                tracing::debug!(
-                    ?desc,
-                    used,
-                    budget,
-                    bytes,
-                    "host texture skipped (VICTORY_HOST_TEXTURE_BUDGET_MB)"
-                );
+                static SKIPPED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n.is_power_of_two() {
+                    tracing::info!(
+                        n,
+                        ?desc,
+                        used,
+                        budget,
+                        bytes,
+                        "host texture skipped (VICTORY_HOST_TEXTURE_BUDGET_MB)"
+                    );
+                }
                 return None;
             }
         }
