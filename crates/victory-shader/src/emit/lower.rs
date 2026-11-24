@@ -805,11 +805,11 @@ impl<'a> Lower<'a> {
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         if self.emulate_wave.is_some() {
-            if prefix.is_some() {
-                return Err("an emulated wave prefix");
-            }
             let x = if float { self.as_int(arg) } else { arg };
-            return self.emulate_active_op(c, op, x);
+            return match prefix {
+                None => self.emulate_active_op(c, op, x),
+                Some(inclusive) => self.emulate_prefix_op(c, op, x, id, inclusive),
+            };
         }
         self.s.flags |= flags::WAVE_OPS;
         let r = match (op, prefix) {
@@ -862,6 +862,58 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
+    /// Inclusive or exclusive prefix of `x` (already masked) over the emulated wave.
+    /// Only sums, matching the DXIL `wavePrefixOp` path.
+    fn emulate_prefix_op(
+        &mut self,
+        at: usize,
+        op: super::wave::Op,
+        x: V,
+        ident: V,
+        inclusive: bool,
+    ) -> Result<V, Why> {
+        if !matches!(op, super::wave::Op::AddU | super::wave::Op::AddF) {
+            return Err("an emulated wave prefix of an operation other than a sum");
+        }
+        let n = self.emulate_wave.ok_or("emulate_wave")?;
+        let me = self.lane_index_at(at);
+        let p = self.wave_scratch_ptr(at, me);
+        self.s.m.store(at, p, x);
+        self.wave_sync(at);
+        // Hillis–Steele inclusive scan in LDS. Barrier between loads and
+        // stores so host waves that share a virtual wave cannot overwrite
+        // a neighbour's value before it is read.
+        let mut d = 1u32;
+        while d < n {
+            let d_v = self.s.m.i32(d);
+            let has = self.s.m.cmp(at, pred::IUGE, me, d_v);
+            let src = self.s.m.bin(at, Bin::Sub, me, d_v);
+            let p_me = self.wave_scratch_ptr(at, me);
+            let p_src = self.wave_scratch_ptr(at, src);
+            let a = self.s.m.load(at, p_me);
+            let b = self.s.m.load(at, p_src);
+            self.wave_sync(at);
+            let folded = self.emulate_fold(at, op, b, a)?;
+            let keep = self.s.m.select(at, has, folded, a);
+            self.s.m.store(at, p_me, keep);
+            self.wave_sync(at);
+            d *= 2;
+        }
+        let p_me = self.wave_scratch_ptr(at, me);
+        let incl = self.s.m.load(at, p_me);
+        if inclusive {
+            return Ok(incl);
+        }
+        // Exclusive: lane 0 → identity; else inclusive of lane me-1.
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let is0 = self.s.m.cmp(at, pred::EQ, me, zero);
+        let prev = self.s.m.bin(at, Bin::Sub, me, one);
+        let p_prev = self.wave_scratch_ptr(at, prev);
+        let excl = self.s.m.load(at, p_prev);
+        Ok(self.s.m.select(at, is0, ident, excl))
+    }
+
     /// Tree reduction of `x` (already masked) over the emulated wave.
     fn emulate_active_op(&mut self, at: usize, op: super::wave::Op, x: V) -> Result<V, Why> {
         let n = self.emulate_wave.ok_or("emulate_wave")?;
@@ -879,6 +931,7 @@ impl<'a> Lower<'a> {
             let p_ot = self.wave_scratch_ptr(at, other);
             let a = self.s.m.load(at, p_me);
             let b = self.s.m.load(at, p_ot);
+            self.wave_sync(at);
             let folded = self.emulate_fold(at, op, a, b)?;
             let keep = self.s.m.select(at, low, folded, a);
             self.s.m.store(at, p_me, keep);
