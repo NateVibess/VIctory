@@ -180,8 +180,11 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = hardware_adapter()? {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!("host D3D12 device on the default adapter");
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -245,6 +248,53 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
             ));
         }
         Ok(adapter)
+    }
+}
+
+/// A hardware adapter for the host device: prefer NVIDIA (0x10DE) so a
+/// laptop with Iris Xe + RTX does not silently run on the iGPU. Falls back
+/// to the first non-software adapter.
+fn hardware_adapter() -> windows::core::Result<Option<IDXGIAdapter>> {
+    const NVIDIA: u32 = 0x10de;
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let mut nvidia = None;
+        let mut first = None;
+        for i in 0.. {
+            let adapter = match factory.EnumAdapters1(i) {
+                Ok(a) => a,
+                Err(_) => break,
+            };
+            let desc = adapter.GetDesc1()?;
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let name = String::from_utf16_lossy(
+                &desc.Description[..desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len())],
+            );
+            tracing::info!(
+                i,
+                vendor = format_args!("{:#x}", desc.VendorId),
+                %name,
+                "host DXGI adapter"
+            );
+            let adapter: IDXGIAdapter = adapter.cast()?;
+            if desc.VendorId == NVIDIA && nvidia.is_none() {
+                nvidia = Some((adapter, name));
+            } else if first.is_none() {
+                first = Some((adapter, name));
+            }
+        }
+        let chosen = nvidia.or(first);
+        if let Some((_, name)) = &chosen {
+            tracing::info!(%name, "host device on hardware adapter");
+        }
+        Ok(chosen.map(|(a, _)| a))
     }
 }
 
