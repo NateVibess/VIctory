@@ -109,13 +109,18 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            wave_size = ?t.host.wave_size,
+                            "shader translated"
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        dump_shader_if_requested(self, &t.host);
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
@@ -126,6 +131,100 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+/// With `VICTORY_DUMP_SHADER=<hash-prefix>`, write matching containers under
+/// the capture folder (or `victory-shader-dumps`) for offline inspection.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_shader_if_requested(shader: &Shader, host: &victory_shader::emit::HostShader) {
+    let Some(want) = std::env::var("VICTORY_DUMP_SHADER").ok() else {
+        return;
+    };
+    let want = want.trim().to_ascii_lowercase();
+    // Prefix match: `19e215` dumps `19e215b47ff9112a`; `*` dumps every shader.
+    if want.is_empty() || (want != "*" && !shader.hash.starts_with(&want)) {
+        return;
+    }
+    let fallback = std::path::PathBuf::from("victory-shader-dumps");
+    let dir = crate::capture::folder().unwrap_or(&fallback);
+    let _ = std::fs::create_dir_all(dir);
+    let path = dir.join(format!("{}-{}.bin", shader.stage, shader.hash));
+    match std::fs::write(&path, &shader.container) {
+        Ok(()) => {
+            let profile = profile_compute_container(&shader.container);
+            tracing::warn!(
+                path = %path.display(),
+                hash = %shader.hash,
+                wave_size = ?host.wave_size,
+                bytes = shader.container.len(),
+                threads = ?profile.threads,
+                wave64 = profile.wave64,
+                lds_bytes = profile.lds_bytes,
+                code_bytes = profile.code_bytes,
+                s_cbranch = profile.s_cbranch,
+                "VICTORY_DUMP_SHADER: wrote console container"
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "VICTORY_DUMP_SHADER: write failed"),
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+struct ComputeProfile {
+    threads: Option<[u32; 3]>,
+    wave64: Option<bool>,
+    lds_bytes: Option<u32>,
+    code_bytes: usize,
+    /// Rough count of conditional branches in the patched GFX10 stream
+    /// (`s_cbranch_*`), a stand-in for loop / control-flow density.
+    s_cbranch: usize,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn profile_compute_container(container: &[u8]) -> ComputeProfile {
+    use victory_shader::native::StageIo;
+    use victory_shader::{Container, FourCC, HwStage, native_programs};
+    let empty = ComputeProfile {
+        threads: None,
+        wave64: None,
+        lds_bytes: None,
+        code_bytes: 0,
+        s_cbranch: 0,
+    };
+    let Ok(c) = Container::parse(container) else {
+        return empty;
+    };
+    let Some(dxil) = c.part(FourCC::DXIL) else {
+        return empty;
+    };
+    let Ok(programs) = native_programs(dxil.data) else {
+        return empty;
+    };
+    let Some(native) = programs.into_iter().find(|p| p.stage == HwStage::Cs) else {
+        return empty;
+    };
+    let (threads, lds_bytes) = match &native.io {
+        StageIo::Cs(cs) => (Some(cs.threads), Some(cs.lds_bytes())),
+        _ => (None, None),
+    };
+    let code = native.patched_code();
+    // GFX10 `s_cbranch_*` encodings: high byte 0xBF, low nibble of next is
+    // the SOPP opcode family used for branches (0x2..0xB roughly). Count
+    // 0xBF8x words as a density signal, not a precise loop tally.
+    let s_cbranch = code
+        .chunks_exact(4)
+        .filter(|w| {
+            let op = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            (op >> 23) & 0x1FF == 0x17C && matches!((op >> 16) & 0x7F, 0x2..=0xB)
+        })
+        .count();
+    ComputeProfile {
+        threads,
+        wave64: Some(native.wave64),
+        lds_bytes,
+        code_bytes: code.len(),
+        s_cbranch,
     }
 }
 
