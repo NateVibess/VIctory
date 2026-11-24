@@ -449,6 +449,28 @@ impl Host {
         })
     }
 
+    /// Largest wave the host device runs (WARP is often 4). Compute shaders
+    /// that declare a larger `WaveSize` are refused.
+    pub(crate) fn max_wave_lanes(&self) -> u32 {
+        static MAX: OnceLock<u32> = OnceLock::new();
+        *MAX.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let max = if ok { options.WaveLaneCountMax } else { 0 };
+            tracing::info!(max, "host max wave lane count");
+            max
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.

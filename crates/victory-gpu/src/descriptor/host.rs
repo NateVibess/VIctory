@@ -279,13 +279,26 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    /// host cannot. Returns whether a real view was made (not a null stand-in).
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> bool {
         let kept = make(view, self.cpu(index));
-        if kept.is_none() {
+        let ok = kept.is_some();
+        if !ok {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
+        ok
+    }
+
+    /// Whether slot `index` holds a host resource from the last successful
+    /// [`make`] / [`make_at`] (unordered and shader views of textures or
+    /// buffers). A null stand-in leaves it empty.
+    pub(crate) fn slot_bound(&self, index: u32) -> bool {
+        self.kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(|r| r.is_some())
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -717,10 +730,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                // Placed texture SRV/UAV: [`placed_texture`] should have
+                // turned this into a Shader/Unordered view. Reaching here
+                // means the host copy could not be made (budget skip, OOM).
+                once!(
+                    dimension = resource[0],
+                    unordered = *unordered,
+                    "placed texture view not mirrored"
+                );
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -736,11 +753,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered view of a texture the title placed in memory
+/// itself, as a view of the resource made for that memory (on first use).
+/// Triggers lazy host-texture creation via [`crate::resource::texture_at`]
+/// and [`crate::resource::host_resource`].
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
@@ -748,7 +767,12 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words = desc[..10].try_into().ok();
+    if *unordered {
+        Some(View::Unordered(texture as usize, 0, words))
+    } else {
+        Some(View::Shader(texture as usize, words))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

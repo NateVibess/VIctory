@@ -466,7 +466,7 @@ impl State {
                 if n.is_power_of_two() {
                     tracing::warn!(
                         dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
+                        "a draw or dispatch dropped: no dynamic slots or a UAV the host could not make"
                     );
                 }
                 return false;
@@ -618,7 +618,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -630,7 +630,14 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            // A null UAV stand-in (failed make / skipped host texture) still
+            // leaves the slot "made"; writing through it removes the device.
+            if u.kind == ResourceType::Uav && !host.slot_bound(index) {
+                self.table_failed = true;
+            }
             readable(list, u, &view);
+        } else if u.kind == ResourceType::Uav {
+            self.table_failed = true;
         }
     }
 
@@ -750,8 +757,11 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        let ok = host.make_at(index, &view);
                         if let Some(u) = used {
+                            if u.kind == ResourceType::Uav && !ok {
+                                self.table_failed = true;
+                            }
                             readable(list, u, &view);
                         }
                     }
