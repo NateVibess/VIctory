@@ -124,6 +124,9 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_LAZY_HOST_TEXTURES=1` | defer host GPU copies of sampled-only textures until first use (cuts commit at load; diagnostics builds honour it) |
+| `VICTORY_HOST_TEXTURE_MAX_DIM=<n>` | skip host copies of sampled-only textures wider or taller than `n` (render targets and depth still created) |
+| `VICTORY_HOST_TEXTURE_BUDGET_MB=<n>` | after about `n` MiB of host texture copies, skip further sampled-only creates |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |

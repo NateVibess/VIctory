@@ -746,9 +746,25 @@ struct Resource {
     heap_flags: u32,
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// yet. Deferred until first use when `VICTORY_LAZY_HOST_TEXTURES` is
+    /// set (shader-resource-only textures).
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::Mutex<HostSlot>,
+}
+
+/// Whether a host copy exists yet, or is waiting for first use / gave up.
+#[cfg(windows)]
+enum HostSlot {
+    /// Buffers, or a texture we will not host.
+    None,
+    /// Shader-resource-only: create on first draw / upload.
+    Deferred {
+        state: u32,
+        clear: Option<[u32; 5]>,
+    },
+    Ready(std::sync::Arc<HostTexture>),
+    /// Create failed or a low-memory policy skipped it.
+    Failed,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -761,6 +777,101 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// Estimated DEFAULT-heap bytes, for `VICTORY_HOST_TEXTURE_BUDGET_MB`.
+    bytes: u64,
+}
+
+#[cfg(windows)]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        HOST_TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Running estimate of host DEFAULT-heap texture bytes currently live.
+#[cfg(windows)]
+static HOST_TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_LAZY_HOST_TEXTURES`: defer host GPU copies for textures that are
+/// only sampled (not render-target, depth or UAV) until first use.
+#[cfg(windows)]
+fn lazy_host_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_HOST_TEXTURES").is_some())
+}
+
+/// `VICTORY_HOST_TEXTURE_MAX_DIM`: skip host copies of sampled-only textures
+/// whose width or height is above this (render targets and depth stay).
+#[cfg(windows)]
+fn host_texture_max_dim() -> Option<u32> {
+    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("VICTORY_HOST_TEXTURE_MAX_DIM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
+/// `VICTORY_HOST_TEXTURE_BUDGET_MB`: after this many MiB of host texture
+/// copies, further sampled-only creates are skipped (bind targets still try).
+#[cfg(windows)]
+fn host_texture_budget_bytes() -> Option<u64> {
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("VICTORY_HOST_TEXTURE_BUDGET_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+    })
+}
+
+/// Render-target, depth or unordered-access: needed as soon as the title
+/// creates them.
+#[cfg(windows)]
+fn is_bind_target(flags: u32) -> bool {
+    const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    flags & (RENDER_TARGET | DEPTH | UNORDERED) != 0
+}
+
+/// Rough DEFAULT-heap size of a host texture with the title's description.
+#[cfg(windows)]
+fn estimate_host_bytes(desc: &ResourceDesc) -> u64 {
+    let format = pc_format(desc.format);
+    let (elem, block) = element(format).unwrap_or((4, 1));
+    let mips = mip_count(desc).max(1);
+    let layers = if desc.dimension == TEXTURE_3D {
+        1
+    } else {
+        u64::from(desc.depth_or_array_size).max(1)
+    };
+    let mut total = 0u64;
+    let mut w = desc.width.max(1);
+    let mut h = u64::from(desc.height).max(1);
+    let mut depth = if desc.dimension == TEXTURE_3D {
+        u64::from(desc.depth_or_array_size).max(1)
+    } else {
+        1
+    };
+    for _ in 0..mips {
+        let bw = w.div_ceil(block);
+        let bh = h.div_ceil(block);
+        total = total.saturating_add(
+            bw.saturating_mul(bh)
+                .saturating_mul(depth)
+                .saturating_mul(elem)
+                .saturating_mul(layers),
+        );
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+        if desc.dimension == TEXTURE_3D {
+            depth = (depth / 2).max(1);
+        }
+    }
+    total
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -768,7 +879,7 @@ pub(crate) struct HostTexture {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = host_copy(this)?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -783,30 +894,94 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    ensure_host(this)?;
+    let slot = resource(this).host.lock().unwrap_or_else(|e| e.into_inner());
+    let HostSlot::Ready(h) = &*slot else {
+        return None;
+    };
+    let p = std::ptr::from_ref(&h.texture);
+    // SAFETY: the Arc stays in `Resource.host` until the resource drops;
+    // callers do not hold this reference across that.
+    Some(unsafe { &*p })
 }
 
-/// A title texture's host copy, shared, for a list to hold.
+/// A title texture's host copy, shared, for a list to hold. Creates a
+/// deferred copy on first use when lazy host textures are on.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    ensure_host(this)
+}
+
+/// Makes sure `this` has a host texture if policy allows, and returns it.
+#[cfg(windows)]
+fn ensure_host(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    let r = resource(this);
+    let mut slot = r.host.lock().unwrap_or_else(|e| e.into_inner());
+    match &*slot {
+        HostSlot::Ready(h) => return Some(h.clone()),
+        HostSlot::None | HostSlot::Failed => return None,
+        HostSlot::Deferred { .. } => {}
+    }
+    let HostSlot::Deferred { state, clear } = std::mem::replace(&mut *slot, HostSlot::Failed) else {
+        return None;
+    };
+    match make_host_texture(&r.desc, state, clear.as_ref()) {
+        Some(h) => {
+            let arc = std::sync::Arc::new(h);
+            *slot = HostSlot::Ready(arc.clone());
+            Some(arc)
+        }
+        None => {
+            *slot = HostSlot::Failed;
+            None
+        }
+    }
 }
 
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags. Honours low-memory env limits
+/// for sampled-only textures.
 #[cfg(windows)]
-fn host_texture(
+fn make_host_texture(
     desc: &ResourceDesc,
     state: u32,
-    clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    clear: Option<&[u32; 5]>,
+) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
+    }
+    let sampled_only = !is_bind_target(desc.flags);
+    let bytes = estimate_host_bytes(desc);
+    if sampled_only {
+        if let Some(max) = host_texture_max_dim() {
+            let dim = u32::try_from(desc.width).unwrap_or(u32::MAX).max(desc.height);
+            if dim > max {
+                tracing::debug!(
+                    ?desc,
+                    max,
+                    "host texture skipped (VICTORY_HOST_TEXTURE_MAX_DIM)"
+                );
+                return None;
+            }
+        }
+        if let Some(budget) = host_texture_budget_bytes() {
+            let used = HOST_TEXTURE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+            if used.saturating_add(bytes) > budget {
+                tracing::debug!(
+                    ?desc,
+                    used,
+                    budget,
+                    bytes,
+                    "host texture skipped (VICTORY_HOST_TEXTURE_BUDGET_MB)"
+                );
+                return None;
+            }
+        }
     }
     let host = crate::host::host()?;
     let mut d = *desc;
@@ -834,11 +1009,8 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
-    // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
-        // SAFETY: the title passes a whole clear value.
-        let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
+    let clear_value = clear.map(|value| {
+        let mut value = *value;
         value[0] = pc_format(value[0]);
         value
     });
@@ -864,13 +1036,33 @@ fn host_texture(
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
+        return None;
     }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
-        });
-    }
-    texture
+    let texture = texture?;
+    crate::host::name(&texture, || {
+        format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+    });
+    HOST_TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+    Some(HostTexture {
+        texture,
+        state: state.into(),
+        bytes,
+    })
+}
+
+/// Immediate host copy from a title clear pointer (create path).
+#[cfg(windows)]
+fn host_texture_now(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+) -> Option<HostTexture> {
+    let clear = (!clear.is_null()).then(|| {
+        // SAFETY: the title passes a whole clear value.
+        unsafe { clear.cast::<[u32; 5]>().read_unaligned() }
+    });
+    make_host_texture(desc, state, clear.as_ref())
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -928,7 +1120,22 @@ fn hand_out_resource(
     #[cfg(not(windows))]
     let _ = (state, clear);
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    let host = {
+        if desc.dimension == BUFFER {
+            HostSlot::None
+        } else if lazy_host_textures() && !is_bind_target(desc.flags) {
+            let clear = (!clear.is_null()).then(|| {
+                // SAFETY: the title passes a whole clear value.
+                unsafe { clear.cast::<[u32; 5]>().read_unaligned() }
+            });
+            HostSlot::Deferred { state, clear }
+        } else {
+            match host_texture_now(&desc, state, clear) {
+                Some(h) => HostSlot::Ready(std::sync::Arc::new(h)),
+                None => HostSlot::Failed,
+            }
+        }
+    };
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -936,13 +1143,7 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-            })
-        }),
+        host: std::sync::Mutex::new(host),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -956,21 +1157,23 @@ fn hand_out_resource(
 impl Drop for Resource {
     fn drop(&mut self) {
         #[cfg(feature = "diagnostics")]
-        if self
-            .host
-            .as_ref()
-            .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
-            // Before lists held their textures, this freed a texture that
-            // lists not yet run still named (a GPU page fault).
-            static OUTLIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = OUTLIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n.is_power_of_two() {
-                tracing::info!(
-                    n,
-                    desc = ?self.desc,
-                    "a title texture was released while a list not yet reset names its host copy"
-                );
+            let slot = self.host.lock().unwrap_or_else(|e| e.into_inner());
+            if let HostSlot::Ready(h) = &*slot
+                && std::sync::Arc::strong_count(h) > 1
+            {
+                // Before lists held their textures, this freed a texture that
+                // lists not yet run still named (a GPU page fault).
+                static OUTLIVED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = OUTLIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(
+                        n,
+                        desc = ?self.desc,
+                        "a title texture was released while a list not yet reset names its host copy"
+                    );
+                }
             }
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
@@ -1174,7 +1377,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    // Host copy may be deferred (`VICTORY_LAZY_HOST_TEXTURES`); the
+    // resource object is what views need.
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
